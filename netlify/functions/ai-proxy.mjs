@@ -1,5 +1,23 @@
-// Netlify Function — proxies requests to Groq API
-// Keeps API key server-side (set GROQ_API_KEY in Netlify env vars)
+// Netlify Function — proxies requests to NVIDIA NIM API (Groq as fallback)
+// Set NVIDIA_API_KEY and GROQ_API_KEY in Netlify Environment Variables
+
+const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
+const GROQ_ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions';
+const NVIDIA_DEFAULT_MODEL = 'meta/llama-4-maverick-17b-128e-instruct';
+const GROQ_FALLBACK_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
+
+async function callProvider(endpoint, apiKey, payload) {
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json();
+  return { response, data };
+}
 
 export async function handler(event) {
   const headers = {
@@ -17,57 +35,80 @@ export async function handler(event) {
     return { statusCode: 405, headers, body: JSON.stringify({ error: 'Method not allowed' }) };
   }
 
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) {
+  const nvidiaKey = process.env.NVIDIA_API_KEY;
+  const groqKey = process.env.GROQ_API_KEY;
+
+  if (!nvidiaKey && !groqKey) {
     return {
       statusCode: 500,
       headers,
-      body: JSON.stringify({ error: 'GROQ_API_KEY not configured. Set it in Netlify Environment Variables.' }),
+      body: JSON.stringify({ error: 'No API keys configured. Set NVIDIA_API_KEY or GROQ_API_KEY in Netlify Environment Variables.' }),
     };
   }
 
   try {
     const body = JSON.parse(event.body);
-    const { messages, model, temperature, max_tokens, response_format } = body;
+    const { messages, temperature, max_tokens, response_format } = body;
 
-    const payload = {
-      model: model || 'meta-llama/llama-4-scout-17b-16e-instruct',
+    const basePayload = {
       messages,
       temperature: temperature ?? 0.7,
       max_tokens: max_tokens || 4096,
     };
 
     if (response_format) {
-      payload.response_format = response_format;
+      basePayload.response_format = response_format;
     }
 
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-    });
+    // Try NVIDIA first
+    if (nvidiaKey) {
+      const payload = { ...basePayload, model: NVIDIA_DEFAULT_MODEL };
+      const { response, data } = await callProvider(NVIDIA_ENDPOINT, nvidiaKey, payload);
 
-    const data = await response.json();
+      if (response.ok) {
+        return {
+          statusCode: 200,
+          headers,
+          body: JSON.stringify({
+            content: data.choices?.[0]?.message?.content || '',
+            model: data.model,
+            usage: data.usage,
+            provider: 'nvidia',
+          }),
+        };
+      }
+      console.warn('NVIDIA API failed, falling back to Groq:', data.error?.message);
+    }
 
-    if (!response.ok) {
+    // Fallback to Groq
+    if (groqKey) {
+      const payload = { ...basePayload, model: GROQ_FALLBACK_MODEL };
+      const { response, data } = await callProvider(GROQ_ENDPOINT, groqKey, payload);
+
+      if (response.ok) {
+        return {
+          statusCode: 200,
+          headers,
+          body: JSON.stringify({
+            content: data.choices?.[0]?.message?.content || '',
+            model: data.model,
+            usage: data.usage,
+            provider: 'groq',
+          }),
+        };
+      }
+
       return {
         statusCode: response.status,
         headers,
-        body: JSON.stringify({ error: data.error?.message || 'Groq API error', details: data }),
+        body: JSON.stringify({ error: data.error?.message || 'Both NVIDIA and Groq API calls failed', details: data }),
       };
     }
 
     return {
-      statusCode: 200,
+      statusCode: 502,
       headers,
-      body: JSON.stringify({
-        content: data.choices?.[0]?.message?.content || '',
-        model: data.model,
-        usage: data.usage,
-      }),
+      body: JSON.stringify({ error: 'NVIDIA API failed and no Groq fallback key is configured.' }),
     };
   } catch (err) {
     return {
